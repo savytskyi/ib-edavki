@@ -1,0 +1,2 @@
+# Official eDavki schemas are verified by SHA-256 (generators/validation.py): keep their bytes, including CRLF
+generators/schemas/edavki/*.xsd -text

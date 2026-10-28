@@ -57,10 +57,76 @@ Pred 2021 smo slovenske stranke IBKR imele račun na britanski podružnici IBUK.
 
 Na strani **Reports** je desno od številke računa v modrem ovalu gumb **Select Account(s)**. S klikom nanj se odpre meni kjer lahko izbiraš za kateri račun želiš poročila. Privzeto računi, ki niso več aktivni niso prikazani, zato klikni na ikono za filtriranje in označi vse tipe računov: Open, Closed in Migrated. Sedaj izbereš vse račune in klikneš **Continue**. Poleg naslova **Reports** boš nato videl vse številke računov, prav tako pa bodo podatki v poročilu sedaj iz vseh računov.
 
+### Izvoz poročil iz Exante, Saxo in TradeStation
+
+Skripta nakupe in prodaje vseh zasebnih računov davčnega zavezanca (IBKR, Exante, Saxo, TradeStation) poveže po metodi
+FIFO: enaka pogodba na različnih računih in pri različnih borznih posrednikih je ena zaloga. Pogodbo določajo osnovni
+instrument, datum zapadlosti, izvršilna cena, vrsta opcije, množitelj in borzna oznaka produkta. Zato mora poročilo
+zajemati **celotno zgodovino računa** (od odprtja do danes), ne le leto napovedi. Vse podane datoteke se združijo ne glede
+na obdobje, zato lahko dodaš tudi poročila prejšnjih let.
+
+**Manjkajoča zgodovina:** cena ali datum nakupa se nikoli ne predpostavi. Prodaja, katere nakupa ni v vhodnih datotekah,
+se poroča brez nakupa (dobiček je zgornja meja, nakup dodaš v eDavkih). Nakup, ki zapira kratko pozicijo brez prodaje v
+podatkih, se v obrazec ne vključi, ker bi prikazal izgubo brez podlage. Vsi taki primeri so v razdelku
+*Missing acquisition history* v `report-<leto>.md` (vrsta: manjkajoč nakup, prenos, izvršitev opcije), s kupnino in znanim
+delom rezultata; ostali posli se izvozijo normalno. Exante posle, ki so le v Financial Transactions, skripta obnovi iz
+knjiženega zneska (razen terminskih pogodb, kjer cene ni).
+
+**Blagovni izvedeni instrumenti (ZDDOIFI, 8. člen, 2. odstavek):** pogodbe na blago, ki jih je treba poravnati z
+dobavo, niso v D-IFI. Razvrstitev temelji na borzni specifikaciji produkta (`importers/contracts.py`), ne na oznaki ali
+osnovnem blagu; MCL, MNG, MHG in MCO so denarno poravnani. Izločeni posli ostanejo v poročilu.
+
+**Vrstni red poslov:** časi z znanim časovnim pasom (Exante, UTC) se primerjajo v UTC, ostali (IBKR, Saxo) se uporabijo
+kot so izvoženi in se nikoli ne štejejo za UTC; TradeStation nima časa. Če bi drug možen vrstni red istega dne spremenil
+FIFO lote, je to navedeno v razdelku *Transaction ordering*.
+
+IBKR-jevi lastni zaprti loti (Closed Lots) se uporabijo le za primerjavo s FIFO; razlike (npr. račun z drugačno metodo
+izbire lotov ali združevanje z drugim računom) so pojasnjene v `report-<leto>.md`. S parametrom `--ibkr-lots` skripta
+za IBKR uporabi IBKR-jeve lote kot doslej, brez združevanja z drugimi računi.
+
+**Lastništvo računov:** v datoteki `accounts.xml` (poleg `taxpayer.xml`) za vsak račun določiš, ali je zaseben
+(`private`) ali podjetniški (`company`). Računi, ki jih ni v datoteki, se obravnavajo kot zasebni in se samodejno dodajo
+v `accounts.xml`. Podjetniški računi ne gredo v osebne obrazce, skripta zanje ustvari mapo `company-<leto>-<ime>/` s CSV
+datotekami za knjigovodstvo (posli, realizirani rezultat, odprte pozicije ter dividende, davki, obresti in stroški
+financiranja, tudi iz IBKR).
+
+```xml
+<accounts>
+    <account><broker>exante</broker><id>ABC1234.001</id><owner>company</owner><name>Podjetje d.o.o.</name></account>
+</accounts>
+```
+
+Skripta vedno ustvari tudi `report-<leto>.md` s povzetkom, rezultatom preverjanja XML, uskladitvijo po računih,
+neuporabljenimi vrsticami in vsemi samodejno uporabljenimi predpostavkami, ter `report-<leto>-lots.csv` z vsemi
+realiziranimi loti leta (izvirni ID-ji poslov in cene v izvirni valuti).
+
+**Preverjanje XML:** vsi štirje obrazci se preverijo z uradnimi XML shemami eDavkov (`generators/schemas/edavki`,
+nespremenjene kopije z edavki.durs.si, preverjene s SHA-256). XML je označen kot veljaven samo, če je bila uporabljena
+uradna shema; skripta tudi opozori, če FURS objavi novejšo različico sheme. Potreben je paket `xmlschema`.
+
+**Trgovanje z vzvodom (D-IFI, F9):** CFD in terminske pogodbe ter izdane (prodane) opcije so označene z vzvodom, kupljene
+opcije brez. Pravila in njihova podlaga (primer FURS ali začasna razvrstitev) so v `report-<leto>.md`.
+
+**Zapadlost opcij na terminske pogodbe:** Exante zapadlosti obdela po polnoči UTC, pogosto v soboto. Datum zapadlosti se
+vzame iz simbola, podatkov IBKR ali borznega pravila produkta (MCO, MES, EX1–EX4); sicer se sobota ali praznik premakne na
+predhodni delovni dan. Izvirni čas obdelave je ohranjen v poročilu.
+
+**TradeStation (terminske pogodbe):** Client Center → **Accounts** → **Reports** → **Historical Activity**, Report Type
+**Trades**, izvoz v **CSV**. Mesečni izpiski v PDF se ne uvažajo. Preveri, da CSV vsebuje vse posle (primerjaj z
+mesečnimi izpiski), po potrebi izvozi po mesecih.
+
+**Exante:** Client's Area → **Reports** → **Create a custom report**. Datumsko obdobje nastavi pri **Trades** in
+**Financial Transactions**, izberi **CSV** in klikni **Save and Send**. Poročilo prenesi iz seznama na isti strani.
+
+**Saxo:** SaxoTraderGO → **Account** → **Historic reports** → **Transactions** → **Export** → **Excel**.
+Uporabljen je zavihek *Trades*.
+
+Datoteke dodaš kot argumente, skupaj z IB poročili, npr. `ib_edavki ib-2025.xml exante.csv Transactions.xlsx`.
+
 ### Konverzija IB poročila v popisne liste primerne za uvoz v eDavke
 
 ```
-ib_edavki [-h] [-y report-year] [-t] ib-xml-file-2021 [ib-xml-file-2020] [ib-xml-file-2019]
+ib_edavki [-h] [-y report-year] [-t] [--ibkr-lots] ib-xml-file-2021 [ib-xml-file-2020] [ib-xml-file-2019]
 ```
 Kot argument dodaj reporte za vsa leta trgovanja, npr:
 ```

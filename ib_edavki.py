@@ -13,7 +13,13 @@ from collections import defaultdict
 from difflib import SequenceMatcher
 from xml.dom import minidom
 
-from generators import doh_obr
+from generators import company as companyExport, doh_obr, report, validation
+from importers import exante, ibkr, saxo, tradestation
+from importers.accounts import COMPANY, PRIVATE, Accounts
+from importers.audit import Audit
+from importers import contracts
+from importers.contracts import isLeveraged
+from importers.fifo import matchByOwner
 
 bsRateXmlUrl = "https://www.bsi.si/_data/tecajnice/dtecbs-l.xml"
 normalAssets = ["STK", "FUND"]
@@ -74,10 +80,9 @@ def addStockSplits(corporateActions):
                 print("Stock split Corporate Action for conid='" + conid + "' (symbol '" + symbol + "') has issues with date and time attribute (" + strDate, strTime + "), which is a crucial stock split information!")
                 return               
 
-            # check if the same split was added from a different report
-            for split in stockSplits[key]:
-                if split["dateTime"] == dateTime and split["multiplier"] == multiplier:
-                    continue
+            # the same split can be listed in several reports or accounts, it must only be applied once
+            if any(split["dateTime"] == dateTime and split["multiplier"] == multiplier for split in stockSplits[key]):
+                continue
 
             stockSplits[key].append({"dateTime": dateTime, "multiplier": multiplier})
 
@@ -95,6 +100,14 @@ def updateChangedCusipIsin(corporateActions):
             cusipIsinOld = descriptionSearch.group(1)
             cusipIsinNew = descriptionSearch.group(2)
             cusipIsinChanges[cusipIsinOld] = cusipIsinNew
+
+
+""" Doh-KDVP and D-IFI decimals are unsigned patterns, so a rounded negative zero ("-0.0000") would be rejected """
+def decimal(value, places=4):
+    text = "{0:.{1}f}".format(value, places)
+    if text.startswith("-") and float(text) == 0:
+        text = text[1:]
+    return text
 
 
 """ Gets the currency rate for a given date and currency. If no rate exists for a given
@@ -124,6 +137,128 @@ def getCurrencyRate(dateStr, currency, rates):
     return rate
 
 
+""" Interest payer data for Doh-Obr of non-IBKR brokers """
+brokerPayers = {
+    "exante": {"name": "XNT Ltd (EXANTE)", "taxNumber": "", "address": "", "country": "MT"},
+    "saxo": {"name": "Saxo Bank A/S", "taxNumber": "", "address": "Philip Heymans Alle 15, 2900 Hellerup", "country": "DK"},
+    "tradestation": {"name": "TradeStation", "taxNumber": "", "address": "", "country": ""},
+}
+
+
+def findCompany(companies, isin, symbol):
+    for x in companies:
+        if isin and x["isin"] == isin:
+            return x
+    for x in companies:
+        if x["symbol"] == symbol:
+            return x
+    return None
+
+
+""" Converts private Exante/Saxo cash rows of the report year into Doh-Div dividends and Doh-Obr interest.
+    Withholding taxes are added to their linked dividend. Everything else is listed as unused in the audit report.
+"""
+def importBrokerIncome(cash, companies, isinBySymbol, rates, reportYear, audit):
+    dividends = []
+    dividendsById = {}
+    interests = []
+    yearCash = [c for c in cash if c["date"][0:4] == str(reportYear)]
+    for c in yearCash:
+        if c["currency"] == "EUR":
+            c["amountEUR"] = c["amount"]
+        else:
+            c["amountEUR"] = c["amount"] / getCurrencyRate(c["date"], c["currency"], rates)
+
+    for c in yearCash:
+        if c["category"] != "dividend":
+            continue
+        symbol = re.split(r"[.:/]", c["symbol"] or "")[0]
+        isin = c.get("isin") or isinBySymbol.get(c["symbol"])
+        dividend = {
+            "currency": c["currency"],
+            "type": "Dividends",
+            "conid": "",
+            "amount": c["amount"],
+            "amountEUR": c["amountEUR"],
+            "symbol": symbol,
+            "description": c["comment"],
+            "dateTime": c["date"] + ";" + c["time"],
+            "transactionID": c["transactionID"],
+            "tax": 0,
+            "taxEUR": 0,
+            "isin": isin or "",
+            "securityID": isin or symbol,
+        }
+        company = findCompany(companies, isin, symbol)
+        if company is not None:
+            for key in ["name", "taxNumber", "address", "country", "reliefStatement"]:
+                if key in company:
+                    dividend[key] = company[key]
+        else:
+            audit.add("Dividend payer %s (%s) is not in companies.xml, Doh-Div uses the symbol as payer name; add it to "
+                      "companies-local.xml." % (symbol, isin or "no ISIN"))
+        dividends.append(dividend)
+        dividendsById[c["transactionID"]] = dividend
+
+    for c in yearCash:
+        owner = "private"
+        if c["category"] == "dividend":
+            continue
+        if c["category"] == "withholding tax":
+            dividend = dividendsById.get(c.get("dividendTransactionID"))
+            if dividend is not None:
+                dividend["taxEUR"] += -c["amountEUR"]
+                continue
+            audit.add("%s withholding tax %s %.2f %s on %s has no dividend in %d, it is not claimed as foreign tax."
+                      % (c["broker"], c["symbol"], c["amount"], c["currency"], c["date"], reportYear))
+        elif c["category"] == "interest" and c["amount"] > 0:
+            payer = brokerPayers.get(c["broker"], {"name": c["broker"], "taxNumber": "", "address": "", "country": ""})
+            interests.append({"dateTime": c["date"], "amountEUR": c["amountEUR"], "taxEUR": 0.0, "payer": payer})
+            audit.add("Interest payer for %s in Doh-Obr: %s, %s (tax number not known)." % (c["broker"], payer["name"], payer["country"]))
+            continue
+        category = c["category"]
+        if category == "interest":
+            category = "interest paid (not income)"
+        audit.unusedRow(owner, c["broker"], c["accountId"], category, c["amount"], c["currency"])
+    return dividends, interests
+
+
+""" Per account: imported executions, executions and closes in the year, realized result per currency and the
+    broker's own P&L figure where the export has one (Exante, average cost based). """
+def reconciliation(brokerTrades, privateBrokerTrades, companyTrades, accounts, reportYear):
+    year = str(reportYear)
+    matched = list(privateBrokerTrades) + [t for ts in companyTrades.values() for t in ts]
+    byId = {t["transactionID"]: t for t in matched}
+    realized = defaultdict(lambda: defaultdict(float))
+    closes = defaultdict(int)
+    for t in matched:
+        if t["openCloseIndicator"] != "C" or t["tradeDate"][0:4] != year:
+            continue
+        closes[(t["broker"], t["accountId"])] += 1
+        for tid, lot in t["openTransactionIds"].items():
+            realized[(t["broker"], t["accountId"])][t["currency"]] += lot["quantity"] * (t["tradePrice"] - byId[tid]["tradePrice"])
+
+    lines = ["| Owner | Broker | Account | Executions imported | Executions %s | Closing %s | Realized %s (FIFO) | Broker P&L %s |" % (year, year, year, year),
+             "|---|---|---|---:|---:|---:|---:|---:|"]
+    for broker, accountId in sorted({(t["broker"], t["accountId"]) for t in brokerTrades}):
+        accountTrades = [t for t in brokerTrades if (t["broker"], t["accountId"]) == (broker, accountId)]
+        inYear = [t for t in accountTrades if t["tradeDate"][0:4] == year]
+        brokerPnl = defaultdict(float)
+        for t in inYear:
+            if "brokerPnl" in t:
+                brokerPnl[t["currency"]] += t["brokerPnl"]
+        lines.append("| %s | %s | %s | %d | %d | %d | %s | %s |" % (
+            accounts.owner(broker, accountId), broker, accountId, len(accountTrades), len(inYear),
+            closes[(broker, accountId)],
+            ", ".join("%.2f %s" % (v, k) for k, v in sorted(realized[(broker, accountId)].items())) or "0",
+            ", ".join("%.2f %s" % (v, k) for k, v in sorted(brokerPnl.items())) or "n/a"))
+    lines.append("")
+    lines.append("Realized results are in trade currency, before commissions. Broker P&L is Exante's P&L column and "
+                 "IBKR's fifoPnlRealized (after commissions); it differs when the broker uses average cost, includes "
+                 "commissions, or when lots are pooled across accounts.")
+    return lines
+
+
 def main():
     if not os.path.isfile("taxpayer.xml"):
         print("Modify taxpayer.xml and add your data first!")
@@ -147,9 +282,9 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "ibXmlFiles",
-        metavar="ib-xml-file",
-        help="InteractiveBrokers XML output file(s) (see README.md on how to generate one)",
+        "reportFiles",
+        metavar="report-file",
+        help="InteractiveBrokers XML, Exante CSV or Saxo XLSX report file(s) (see README.md on how to generate them)",
         nargs="+",
     )
     parser.add_argument(
@@ -166,9 +301,32 @@ def main():
         help="Change trade dates to previous year (see README.md)",
         action="store_true",
     )
+    parser.add_argument(
+        "--ibkr-lots",
+        help="Use IBKR's own closed lots instead of the taxpayer FIFO across all brokers (previous behaviour)",
+        action="store_true",
+    )
 
     args = parser.parse_args()
-    ibXmlFilenames = args.ibXmlFiles
+    ibXmlFilenames = []
+    exanteFilenames = []
+    saxoFilenames = []
+    tradestationFilenames = []
+    for filename in args.reportFiles:
+        if saxo.isSaxoFile(filename):
+            saxoFilenames.append(filename)
+        elif tradestation.isTradeStationFile(filename):
+            tradestationFilenames.append(filename)
+        elif exante.isExanteFile(filename):
+            exanteFilenames.append(filename)
+        elif filename.lower().endswith(".pdf"):
+            print("Skipping " + filename + ": PDF statements are not imported, use the broker's CSV/XLSX/XML export")
+        else:
+            ibXmlFilenames.append(filename)
+    accounts = Accounts()
+    audit = Audit()
+    stockSplits.clear()
+    cusipIsinChanges.clear()
     test = args.t
     if args.y == 0:
         if test == True:
@@ -328,10 +486,27 @@ def main():
     ibCashTransactionsList = []
     ibSecuritiesInfoList = []
     ibEntities = []
+    ibTradeSections = []
+    ibTransferSections = []
+    ibCompanyCashSections = []
     for ibXmlFilename in ibXmlFilenames:
         ibXml = xml.etree.ElementTree.parse(ibXmlFilename).getroot()
         ibFlexStatements = ibXml[0]
         for ibFlexStatement in ibFlexStatements:
+            corporateActions = ibFlexStatement.find("CorporateActions")
+            if corporateActions is not None:
+                addStockSplits(corporateActions)
+                updateChangedCusipIsin(corporateActions)
+            ibTransferSections.append((ibFlexStatement.get("accountId"), ibFlexStatement.find("Transfers")))
+            if accounts.owner("ibkr", ibFlexStatement.get("accountId")) == COMPANY:
+                ibCompanyCashSections.append((ibFlexStatement.get("accountId"), ibFlexStatement.find("CashTransactions")))
+                if args.ibkr_lots:
+                    audit.add("IBKR account %s is a company account and is excluded from personal forms. With "
+                              "--ibkr-lots its trades are not exported, its cash transactions are." % ibFlexStatement.get("accountId"))
+                else:
+                    ibTradeSections.append((ibFlexStatement.get("accountId"), ibFlexStatement.find("Trades")))
+                continue
+            ibTradeSections.append((ibFlexStatement.get("accountId"), ibFlexStatement.find("Trades")))
             ibTradesList.append(ibFlexStatement.find("Trades"))
             ibCashTransactionsList.append(ibFlexStatement.find("CashTransactions"))
             ibSecuritiesInfoList.append(ibFlexStatement.find("SecuritiesInfo"))
@@ -360,10 +535,12 @@ def main():
                     + ibXmlFilename
                 )
 
-            corporateActions = ibFlexStatement.find("CorporateActions")
-            if corporateActions is not None:
-                addStockSplits(corporateActions)
-                updateChangedCusipIsin(corporateActions)
+    """ IBKR trades join the taxpayer FIFO pool with the other brokers; IBKR's own lots are only kept for the
+        benchmark. With --ibkr-lots the previous IBKR-only processing below is used instead. """
+    ibkrTrades = []
+    if not args.ibkr_lots:
+        ibkrTrades = ibkr.importTrades(ibTradeSections, getSplitMultiplier, getLatestCusipIsin, audit)
+        ibTradesList = []
 
     if test == True:
         statementStartDate = str(reportYear + testYearDiff) + "0101"
@@ -552,6 +729,45 @@ def main():
         if match == False:
             trades[symbol] = tradesBySymbol[symbol]
 
+    """ Closing trades are matched to opening trades using FIFO. Private accounts of all brokers are matched together
+        at taxpayer level (the same contract at different brokers is one inventory), company accounts are matched per
+        company and never enter personal forms. """
+    brokerTrades = list(ibkrTrades)
+    unresolvedExecutions = []
+    if len(exanteFilenames) > 0:
+        brokerTrades += exante.importTrades(exanteFilenames, audit, unresolvedExecutions)
+    if len(saxoFilenames) > 0:
+        brokerTrades += saxo.importTrades(saxoFilenames, audit)
+    if len(tradestationFilenames) > 0:
+        brokerTrades += tradestation.importTrades(tradestationFilenames, audit)
+
+    def missingHistory(message):
+        audit.add("INCOMPLETE DATA: " + message)
+        print("WARNING: " + message)
+
+    orderingRisks = []
+    privateBrokerTrades, companyTrades = matchByOwner(brokerTrades, accounts, missingHistory, orderingRisks)
+
+    """ ZDDOIFI Article 8(2): commodity derivatives that must be settled by delivery are not declared in D-IFI. Their
+        transactions stay in the pool (FIFO, lots CSV) and are listed in the report. """
+    excludedIds = {}
+    excludedSettlement = []
+    for trade in privateBrokerTrades:
+        if trade["assetCategory"] in ignoreAssets:
+            excludedIds[trade["transactionID"]] = "asset category %s is not declared" % trade["assetCategory"]
+        elif trade["assetCategory"] in ("FUT", "FOP") and contracts.settlementScope(
+                trade["contractKey"], trade["assetCategory"], trade.get("exchange"))[0] == "excluded":
+            excludedIds[trade["transactionID"]] = "physically settled commodity derivative (ZDDOIFI Article 8(2))"
+            excludedSettlement.append(trade)
+
+    for trade in privateBrokerTrades:
+        if trade["transactionID"] in excludedIds:
+            continue
+        if trade["contractKey"] not in trades:
+            trades[trade["contractKey"]] = []
+        trades[trade["contractKey"]].append(trade)
+        tradesByTransactionID[trade["transactionID"]] = trade
+
     """ If a trade is both closing and opening, i.e. it goes from negative into positive
         balance or vice versa, split it into one closing and one opening trade """
     for securityID in trades:
@@ -609,16 +825,23 @@ def main():
             "         YOU NEED TO HANDLE THEM MANUALLY!"""
         )
         for securityID, assetCategories in removed_security_ids.items():
-            trades.pop(securityID, None)
+            for trade in trades.pop(securityID, []):
+                excludedIds[trade["transactionID"]] = "asset category not supported"
             print("         %s: " % securityID, end="")
             for assetCategory in assetCategories:
                 print(" %s" % assetCategory, end=", ")
             print()
 
-    """ Filter trades to only include those that closed in the parameter year and trades that opened the closing position """
+    """ Filter trades to only include those that closed in the parameter year and trades that opened the closing position.
+        A buy-back whose opening sale is missing would be declared as a loss without the sale, so it is withheld and
+        listed in the report (missing history). A sale without its purchase is declared: the gain is an upper bound. """
     yearTrades = {}
+    declaredIds = set()
     for securityID in trades:
         for trade in trades[securityID]:
+            if trade.get("missingHistory") and trade["quantity"] > 0:
+                excludedIds[trade["transactionID"]] = "buy-back without the opening sale (missing history)"
+                continue
             if (
                 trade["tradeDate"][0:4] == str(reportYear)
                 and trade["openCloseIndicator"] == "C"
@@ -650,8 +873,10 @@ def main():
                             ctrade = copy.copy(xtrade)
                             ctrade["quantity"] = trade["openTransactionIds"][tid]["quantity"]
                             yearTrades[securityID].append(ctrade)
+                            declaredIds.add(tid)
 
                 yearTrades[securityID].append(trade)
+                declaredIds.add(trade["transactionID"])
 
     """ Logical trade order can be executed as multiple suborders at different price. Merge suborders in a single logical order. """
     mergedTrades = {}
@@ -722,7 +947,7 @@ def main():
 
     """ Generate the files for Normal """
     envelope = xml.etree.ElementTree.Element(
-        "Envelope", xmlns="http://edavki.durs.si/Documents/Schemas/Doh_KDVP_9.xsd"
+        "Envelope", xmlns=validation.namespace("Doh-KDVP")
     )
     envelope.set(
         "xmlns:edp", "http://edavki.durs.si/Documents/Schemas/EDP-Common-1.xsd"
@@ -795,7 +1020,7 @@ def main():
         ).text = "PLVP"
         Name = xml.etree.ElementTree.SubElement(KDVPItem, "Name").text = trades[0][
             "description"
-        ]
+        ][:100]
         HasForeignTax = xml.etree.ElementTree.SubElement(
             KDVPItem, "HasForeignTax"
         ).text = "false"
@@ -819,7 +1044,7 @@ def main():
         if len(trades) > 0 and "description" in trades[0]:
             Name = xml.etree.ElementTree.SubElement(Securities, "Name").text = trades[
                 0
-            ]["description"]
+            ]["description"][:100]
         IsFond = xml.etree.ElementTree.SubElement(Securities, "IsFond").text = "false"
 
         F8Value = 0
@@ -845,10 +1070,10 @@ def main():
                 F2 = xml.etree.ElementTree.SubElement(PurchaseSale, "F2").text = "B"
                 F3 = xml.etree.ElementTree.SubElement(
                     PurchaseSale, "F3"
-                ).text = "{0:.4f}".format(trade["quantity"])
+                ).text = decimal(trade["quantity"])
                 F4 = xml.etree.ElementTree.SubElement(
                     PurchaseSale, "F4"
-                ).text = "{0:.4f}".format(trade["tradePriceEUR"])
+                ).text = decimal(trade["tradePriceEUR"])
                 F5 = xml.etree.ElementTree.SubElement(
                     PurchaseSale, "F5"
                 ).text = "0.0000"
@@ -863,12 +1088,12 @@ def main():
                 )
                 F7 = xml.etree.ElementTree.SubElement(
                     PurchaseSale, "F7"
-                ).text = "{0:.4f}".format(-trade["quantity"])
+                ).text = decimal(-trade["quantity"])
                 F9 = xml.etree.ElementTree.SubElement(
                     PurchaseSale, "F9"
-                ).text = "{0:.4f}".format(trade["tradePriceEUR"])
+                ).text = decimal(trade["tradePriceEUR"])
             F8Value += trade["quantity"]
-            F8 = xml.etree.ElementTree.SubElement(Row, "F8").text = "{0:.4f}".format(
+            F8 = xml.etree.ElementTree.SubElement(Row, "F8").text = decimal(
                 F8Value
             )
 
@@ -880,7 +1105,7 @@ def main():
         ).text = "PLVPSHORT"
         Name = xml.etree.ElementTree.SubElement(KDVPItem, "Name").text = trades[0][
             "description"
-        ]
+        ][:100]
         HasForeignTax = xml.etree.ElementTree.SubElement(
             KDVPItem, "HasForeignTax"
         ).text = "false"
@@ -904,7 +1129,7 @@ def main():
         if len(trades) > 0 and "description" in trades[0]:
             Name = xml.etree.ElementTree.SubElement(
                 SecuritiesShort, "Name"
-            ).text = trades[0]["description"]
+            ).text = trades[0]["description"][:100]
         IsFond = xml.etree.ElementTree.SubElement(
             SecuritiesShort, "IsFond"
         ).text = "false"
@@ -932,10 +1157,10 @@ def main():
                 F2 = xml.etree.ElementTree.SubElement(PurchaseSale, "F2").text = "A"
                 F3 = xml.etree.ElementTree.SubElement(
                     PurchaseSale, "F3"
-                ).text = "{0:.4f}".format(trade["quantity"])
+                ).text = decimal(trade["quantity"])
                 F4 = xml.etree.ElementTree.SubElement(
                     PurchaseSale, "F4"
-                ).text = "{0:.4f}".format(trade["tradePriceEUR"])
+                ).text = decimal(trade["tradePriceEUR"])
                 F5 = xml.etree.ElementTree.SubElement(
                     PurchaseSale, "F5"
                 ).text = "0.0000"
@@ -950,12 +1175,12 @@ def main():
                 )
                 F7 = xml.etree.ElementTree.SubElement(
                     PurchaseSale, "F7"
-                ).text = "{0:.4f}".format(-trade["quantity"])
+                ).text = decimal(-trade["quantity"])
                 F9 = xml.etree.ElementTree.SubElement(
                     PurchaseSale, "F9"
-                ).text = "{0:.4f}".format(trade["tradePriceEUR"])
+                ).text = decimal(trade["tradePriceEUR"])
             F8Value += trade["quantity"]
-            F8 = xml.etree.ElementTree.SubElement(Row, "F8").text = "{0:.4f}".format(
+            F8 = xml.etree.ElementTree.SubElement(Row, "F8").text = decimal(
                 F8Value
             )
 
@@ -973,7 +1198,7 @@ def main():
 
     """ Generate the files for Derivates """
     envelope = xml.etree.ElementTree.Element(
-        "Envelope", xmlns="http://edavki.durs.si/Documents/Schemas/D_IFI_4.xsd"
+        "Envelope", xmlns=validation.namespace("D-IFI")
     )
     envelope.set(
         "xmlns:edp", "http://edavki.durs.si/Documents/Schemas/EDP-Common-1.xsd"
@@ -1090,12 +1315,13 @@ def main():
                 F2 = xml.etree.ElementTree.SubElement(PurchaseSale, "F2").text = "A"
                 F3 = xml.etree.ElementTree.SubElement(
                     PurchaseSale, "F3"
-                ).text = "{0:.4f}".format(trade["quantity"])
+                ).text = decimal(trade["quantity"])
                 F4 = xml.etree.ElementTree.SubElement(
                     PurchaseSale, "F4"
-                ).text = "{0:.4f}".format(trade["tradePriceEUR"])
-                F9 = xml.etree.ElementTree.SubElement(PurchaseSale, "F9").text = "false"
-                # TODO: kako ugotovit iz reporta F9 = Trgovanje z vzvodom
+                ).text = decimal(trade["tradePriceEUR"])
+                F9 = xml.etree.ElementTree.SubElement(PurchaseSale, "F9").text = (
+                    "true" if isLeveraged(trade["assetCategory"], trade["positionType"]) else "false"
+                )
             else:
                 PurchaseSale = xml.etree.ElementTree.SubElement(TSubItem, "Sale")
                 F5 = xml.etree.ElementTree.SubElement(PurchaseSale, "F5").text = (
@@ -1107,14 +1333,14 @@ def main():
                 )
                 F6 = xml.etree.ElementTree.SubElement(
                     PurchaseSale, "F6"
-                ).text = "{0:.4f}".format(-trade["quantity"])
+                ).text = decimal(-trade["quantity"])
                 F7 = xml.etree.ElementTree.SubElement(
                     PurchaseSale, "F7"
-                ).text = "{0:.4f}".format(trade["tradePriceEUR"])
+                ).text = decimal(trade["tradePriceEUR"])
             F8Value += trade["quantity"]
             F8 = xml.etree.ElementTree.SubElement(
                 TSubItem, "F8"
-            ).text = "{0:.4f}".format(F8Value)
+            ).text = decimal(F8Value)
 
     for securityID in shortDerivateTrades:
         trades = shortDerivateTrades[securityID]
@@ -1131,7 +1357,7 @@ def main():
             TypeName = xml.etree.ElementTree.SubElement(
                 TItem, "TypeName"
             ).text = "finančne pogodbe na razliko"
-        elif trades[0]["assetCategory"] == "OPT":
+        elif trades[0]["assetCategory"] in ["OPT", "FOP"]:
             Type = xml.etree.ElementTree.SubElement(TItem, "Type").text = "03"
             TypeName = xml.etree.ElementTree.SubElement(
                 TItem, "TypeName"
@@ -1180,10 +1406,10 @@ def main():
                 F5 = xml.etree.ElementTree.SubElement(PurchaseSale, "F5").text = "A"
                 F6 = xml.etree.ElementTree.SubElement(
                     PurchaseSale, "F6"
-                ).text = "{0:.4f}".format(trade["quantity"])
+                ).text = decimal(trade["quantity"])
                 F7 = xml.etree.ElementTree.SubElement(
                     PurchaseSale, "F7"
-                ).text = "{0:.4f}".format(trade["tradePriceEUR"])
+                ).text = decimal(trade["tradePriceEUR"])
             else:
                 PurchaseSale = xml.etree.ElementTree.SubElement(TShortSubItem, "Sale")
                 F1 = xml.etree.ElementTree.SubElement(PurchaseSale, "F1").text = (
@@ -1195,16 +1421,17 @@ def main():
                 )
                 F2 = xml.etree.ElementTree.SubElement(
                     PurchaseSale, "F2"
-                ).text = "{0:.4f}".format(-trade["quantity"])
+                ).text = decimal(-trade["quantity"])
                 F3 = xml.etree.ElementTree.SubElement(
                     PurchaseSale, "F3"
-                ).text = "{0:.4f}".format(trade["tradePriceEUR"])
-                F9 = xml.etree.ElementTree.SubElement(PurchaseSale, "F9").text = "false"
-                # TODO: kako ugotovit iz reporta F9 = Trgovanje z vzvodom
+                ).text = decimal(trade["tradePriceEUR"])
+                F9 = xml.etree.ElementTree.SubElement(PurchaseSale, "F9").text = (
+                    "true" if isLeveraged(trade["assetCategory"], trade["positionType"]) else "false"
+                )
             F8Value += trade["quantity"]
             F8 = xml.etree.ElementTree.SubElement(
                 TShortSubItem, "F8"
-            ).text = "{0:.4f}".format(F8Value)
+            ).text = decimal(F8Value)
 
     xmlString = xml.etree.ElementTree.tostring(envelope)
     prettyXmlString = minidom.parseString(xmlString).toprettyxml(indent="\t")
@@ -1370,6 +1597,25 @@ def main():
         readme = " - more info: https://github.com/jamsix/ib-edavki#dodatni-podatki-o-podjetju-za-obrazec-doh-div-opcijsko"
         print(explanation + ", ".join(missing) + readme)
 
+    """ Dividends, withholding taxes and interest from Exante and Saxo """
+    brokerCash = []
+    if len(exanteFilenames) > 0:
+        brokerCash += exante.importCashTransactions(exanteFilenames)
+    if len(saxoFilenames) > 0:
+        brokerCash += saxo.importCashTransactions(saxoFilenames)
+    """ IBKR company accounts: dividends, withholding taxes, interest and financing for the company export """
+    brokerCash += ibkr.importCashTransactions(ibCompanyCashSections)
+    companyCash = defaultdict(list)
+    for c in brokerCash:
+        if accounts.owner(c["broker"], c["accountId"]) == COMPANY:
+            companyCash[accounts.name(c["broker"], c["accountId"])].append(c)
+    privateCash = [c for c in brokerCash if accounts.owner(c["broker"], c["accountId"]) == PRIVATE]
+    isinBySymbol = {t["symbol"]: t["isin"] for t in brokerTrades if "isin" in t}
+    brokerDividends, brokerInterests = importBrokerIncome(
+        privateCash, companies, isinBySymbol, rates, reportYear, audit
+    )
+    dividends += brokerDividends
+
     """ Dividends can be reversed. If there is a reversal, remove both the reversal
         and the original dividend.
         There is no unique identificator that binds a reversal to a dividend, the
@@ -1398,7 +1644,7 @@ def main():
 
     """ Generate Doh-Div.xml """
     envelope = xml.etree.ElementTree.Element(
-        "Envelope", xmlns="http://edavki.durs.si/Documents/Schemas/Doh_Div_3.xsd"
+        "Envelope", xmlns=validation.namespace("Doh-Div")
     )
     envelope.set(
         "xmlns:edp", "http://edavki.durs.si/Documents/Schemas/EDP-Common-1.xsd"
@@ -1513,7 +1759,113 @@ def main():
         reportYear,
         test,
         testYearDiff,
+        brokerInterests,
     )
+
+    """ Company accounting exports, never mixed with personal forms """
+    toEUR = lambda amount, currency, date: amount if currency == "EUR" else amount / getCurrencyRate(date, currency, rates)
+    for companyName in sorted(set(companyTrades) | set(companyCash)):
+        directory = "company-%d-%s" % (reportYear, re.sub(r"[^A-Za-z0-9]+", "-", companyName).strip("-").lower())
+        companyExport.generate(companyName, reportYear, companyTrades.get(companyName, []), companyCash.get(companyName, []),
+                         toEUR, audit, directory)
+        print(directory + "/ created (company accounting export for " + companyName + ")")
+
+    """ Personal forms never contain company records: every declared pool trade belongs to a private account (IBKR
+        cash transactions of personal forms are read from private statements only) """
+    companyInForms = [t for groups in (longNormalTrades, shortNormalTrades, longDerivateTrades, shortDerivateTrades)
+                      for ts in groups.values() for t in ts
+                      if "broker" in t and accounts.owner(t["broker"], t["accountId"]) == COMPANY]
+    if companyInForms:
+        sys.exit("Error: company account trades reached the personal forms: %s" % ", ".join(
+            sorted({t["transactionID"] for t in companyInForms})[0:10]))
+
+    """ Summary, reconciliation and assumptions """
+    summary = []
+    for title, groups in [("Doh-KDVP long", longNormalTrades), ("Doh-KDVP short", shortNormalTrades),
+                          ("D-IFI long", longDerivateTrades), ("D-IFI short", shortDerivateTrades)]:
+        result = sum(-t["quantity"] * t["tradePriceEUR"] for ts in groups.values() for t in ts)
+        summary.append("| %s | %d | %.2f |" % (title, len(groups), result))
+    reportedDividends = [d for d in dividends if round(d["amountEUR"], 2) > 0]
+    audit.section("Personal declarations %d" % reportYear, [
+        "| Form | Items | Result EUR (sales - purchases, before costs and tax) |", "|---|---:|---:|"] + summary + [
+        "",
+        "Doh-Div: %d dividends, gross %.2f EUR, foreign tax %.2f EUR." % (
+            len(reportedDividends), sum(d["amountEUR"] for d in reportedDividends), sum(d["taxEUR"] for d in reportedDividends)),
+        "Doh-Obr from Exante/Saxo: %d interest payments, %.2f EUR (IBKR interest is listed in Doh-Obr.xml)." % (
+            len(brokerInterests), sum(i["amountEUR"] for i in brokerInterests)),
+        "",
+        "Tax rates, holding period reductions and standardized costs (normirani stroški) are applied by eDavki when "
+        "the XML is imported, based on dates and the leverage flag F9; they are not part of the XML.",
+    ])
+    audit.section("Reconciliation %d" % reportYear, reconciliation(brokerTrades, privateBrokerTrades, companyTrades, accounts, reportYear))
+    exanteTrades = [t for t in brokerTrades if t["broker"] == "exante"]
+    if exanteTrades:
+        audit.section("Cash reconciliation (Exante, all years)",
+                      report.cashReconciliationLines(exante.tradeCash(exanteFilenames), exanteTrades))
+    if args.ibkr_lots:
+        audit.add("--ibkr-lots: IBKR trades use IBKR's own closed lots and are not pooled with other brokers or "
+                  "accounts. Exante, Saxo and TradeStation are pooled per taxpayer.")
+    else:
+        audit.section("Personal FIFO pool", report.poolLines(privateBrokerTrades))
+        if ibkrTrades:
+            audit.section("IBKR lots compared with taxpayer FIFO", ibkr.benchmark(
+                privateBrokerTrades + [t for ts in companyTrades.values() for t in ts], toEUR, reportYear))
+        audit.add("FIFO inventory is kept per taxpayer and contract across all private accounts of all brokers, "
+                  "IBKR included (company accounts per company). Contracts are identified by underlying, expiry, "
+                  "strike, right, multiplier and exchange product code (importers/contracts.py).")
+    audit.section("D-IFI leverage flag F9", report.leverageLines(longDerivateTrades, shortDerivateTrades))
+    pools = [("private", privateBrokerTrades)] + sorted(companyTrades.items())
+    settlement = report.settlementLines(pools, excludedSettlement)
+    if settlement:
+        audit.section("Commodity derivatives: settlement and D-IFI scope (ZDDOIFI Article 8(2))", settlement)
+    transfers = ibkr.importTransfers(ibTransferSections)
+    if exanteFilenames:
+        transfers += exante.positionTransfers(exanteFilenames)
+    missingLines, missingCases = report.missingHistoryLines(pools, transfers, unresolvedExecutions, toEUR, reportYear)
+    audit.sections.insert(0, ("Missing acquisition history", missingLines))
+    incomplete = [c for c in missingCases if c["owner"] == "private" and c["trade"]["tradeDate"][0:4] == str(reportYear)]
+    if incomplete:
+        print("WARNING: %d personal closes in %d have no opening in the input (proceeds/cost %.2f EUR); tax basis "
+              "incomplete, see 'Missing acquisition history' in report-%d.md" % (
+                  len(incomplete), reportYear, sum(abs(c["valueEUR"]) for c in incomplete), reportYear))
+    audit.section("Transaction ordering", report.orderingRiskLines(orderingRisks))
+    for risk in orderingRisks:
+        print("WARNING: order of same-day trades in %s on %s (%s) is uncertain and can change FIFO results by %.2f %s" % (
+            risk["contract"], risk["date"], risk["owner"], risk["difference"], risk["currency"]))
+    audit.section("Option expiry dates", report.expiryLines(privateBrokerTrades, reportYear))
+    lotsFilename = "report-%d-lots.csv" % reportYear
+    declaredLotsEUR = report.writeLots(lotsFilename, privateBrokerTrades, toEUR, reportYear, excludedIds)
+    if not args.ibkr_lots or not ibXmlFilenames:
+        formsEUR = sum(-t["quantity"] * t["tradePriceEUR"] for groups in (longNormalTrades, shortNormalTrades,
+                       longDerivateTrades, shortDerivateTrades) for ts in groups.values() for t in ts)
+        completeness = report.completenessLines(
+            brokerTrades, pools, declaredIds, excludedIds, reportYear,
+            lambda t: accounts.owner(t["broker"], t["accountId"]))
+        completeness += ["", "P&L: personal forms %.2f EUR = lots declared in %s %.2f EUR, difference %.2f EUR%s." % (
+            formsEUR, lotsFilename, declaredLotsEUR, round(formsEUR - declaredLotsEUR, 2) + 0.0,
+            "" if abs(formsEUR - declaredLotsEUR) < 0.05 else " (CHECK)")]
+        audit.section("Completeness %d" % reportYear, completeness)
+    audit.add("Brokerage commissions and financing costs are not included in personal forms (eDavki applies standardized costs).")
+    audit.add("Every personal lot realized in %d is listed in %s with the original broker transaction ids and prices "
+              "in the original currency." % (reportYear, lotsFilename))
+
+    """ Validation of the personal forms against the official eDavki schemas """
+    validationResults = [validation.validate(f) for f in ["Doh-KDVP.xml", "D-IFI.xml", "Doh-Div.xml", "Doh-Obr.xml"]]
+    for result in validationResults:
+        print("%s: %s %s" % (result["file"], result["status"], result["reason"] or "against " + str(result["schema"])))
+        for error in result["errors"]:
+            print("    " + error)
+    newerSchemas = validation.checkNewerVersions(lambda url, timeout: requests.get(
+        url, timeout=timeout, headers={"User-Agent": userAgent}))
+    for message in newerSchemas:
+        print("WARNING: " + message)
+    audit.sections.insert(0, ("XML schema validation", validation.reportLines(validationResults, newerSchemas)))
+    for broker, accountId in accounts.discovered:
+        audit.add("Account %s %s is not listed in accounts.xml and was treated as PRIVATE. It was added to accounts.xml; "
+                  "change <owner> to company if needed." % (broker, accountId))
+    accounts.save()
+    audit.write("report-%d.md" % reportYear, "ib-edavki report %d" % reportYear)
+    print("report-%d.md created (summary, reconciliation and assumptions)" % reportYear)
 
 
 if __name__ == "__main__":

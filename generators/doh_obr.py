@@ -5,6 +5,8 @@ import os.path
 from difflib import SequenceMatcher
 from xml.dom import minidom
 
+from generators import validation
+
 """ Fetch ib-affiliates.xml from GitHub if it doesn't exist and use the data for Doh-Obr.xml """
 
 
@@ -65,6 +67,7 @@ def generate(
     reportYear,
     test,
     testYearDiff,
+    brokerInterests=[],
 ):
     interests = []
     for ibCashTransactions in ibCashTransactionsList:
@@ -193,11 +196,12 @@ def generate(
                 break
         if merged == False:
             mergedInterests.append(interest)
-    interests = mergedInterests
+    """ Interest from other brokers is already in EUR and carries its own payer """
+    interests = mergedInterests + list(brokerInterests)
 
     """ Generate Doh-Obr.xml """
     envelope = xml.etree.ElementTree.Element(
-        "Envelope", xmlns="http://edavki.durs.si/Documents/Schemas/Doh_Obr_2.xsd"
+        "Envelope", xmlns=validation.namespace("Doh-Obr")
     )
     envelope.set(
         "xmlns:edp", "http://edavki.durs.si/Documents/Schemas/EDP-Common-1.xsd"
@@ -252,7 +256,10 @@ def generate(
             continue
         Interest = xml.etree.ElementTree.SubElement(Doh_Obr, "Interest")
 
-        ibAffiliateInfo = getIbAffiliateInfo(ibEntities, interest["accountId"])
+        if "payer" in interest:
+            ibAffiliateInfo = interest["payer"]
+        else:
+            ibAffiliateInfo = getIbAffiliateInfo(ibEntities, interest["accountId"])
 
         xml.etree.ElementTree.SubElement(Interest, "Date").text = (
             dYear + "-" + interest["dateTime"][4:6] + "-" + interest["dateTime"][6:8]

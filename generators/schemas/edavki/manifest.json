@@ -1,0 +1,18 @@
+{
+    "source": "https://edavki.durs.si/Documents/Schemas/",
+    "retrieved": "2026-10-28",
+    "note": "Unmodified copies of the official eDavki schemas. On the retrieval date the next version numbers (Doh_KDVP_10, D_IFI_5, Doh_Div_4, Doh_Obr_3, EDP-Common-2) returned 404, so these were the newest published versions. eDavki accepts the form version it currently serves, also for declarations of earlier tax years.",
+    "forms": {
+        "D-IFI": {"file": "D_IFI_4.xsd", "prefix": "D_IFI", "version": 4},
+        "Doh-KDVP": {"file": "Doh_KDVP_9.xsd", "prefix": "Doh_KDVP", "version": 9},
+        "Doh-Div": {"file": "Doh_Div_3.xsd", "prefix": "Doh_Div", "version": 3},
+        "Doh-Obr": {"file": "Doh_Obr_2.xsd", "prefix": "Doh_Obr", "version": 2}
+    },
+    "sha256": {
+        "D_IFI_4.xsd": "a82c97b60326c0b2b3452e9f9027350b484f50aab3254648229db80ccaf6eb4b",
+        "Doh_Div_3.xsd": "9a78d1e56f3b964498002d559878cc7cf3058e51c772d04070a9a5c12e245ac3",
+        "Doh_KDVP_9.xsd": "c84c2208e2ad7098dd2594b54226308393df9aefb2c9184a81063ec8057967d5",
+        "Doh_Obr_2.xsd": "3fd134e0a4ccf6af58d820f69a52b267c5a5f0f5434451d4ad9808201b1891a6",
+        "EDP-Common-1.xsd": "51134b944aefb468e697c3ce61f3fa10bdf6ba4adc64bd9c29cb0fdf457f4ffd"
+    }
+}
