@@ -100,6 +100,18 @@ Skripta vedno ustvari tudi `report-<leto>.md` s povzetkom, rezultatom preverjanj
 neuporabljenimi vrsticami in vsemi samodejno uporabljenimi predpostavkami, ter `report-<leto>-lots.csv` z vsemi
 realiziranimi loti leta (izvirni ID-ji poslov in cene v izvirni valuti).
 
+**Ocena davka (tax-summary):** skripta ustvari še `tax-summary.md` (pregled vseh let v vhodnih datotekah),
+`tax-summary.csv` (zneski po letu, zavezancu, borznem posredniku in obrazcu) in `tax-summary-<leto>.md` (podroben izračun
+leta). Ocena uporablja iste FIFO lote, izključitve, tečaje Banke Slovenije in lastništvo računov kot XML, ki ga ne
+spreminja. Za D-IFI in Doh-KDVP upošteva stopnje glede na leto in dobo imetništva (D-IFI od 2026 enotno 25 %, ZDDOIFI-B),
+normirane stroške (1 % oziroma 0,25 % pri vzvodu, največ do dobička), pobot izgub le znotraj obrazca in leta ter pravilo
+30 dni pri delnicah; za Doh-Div odbitek tujega davka največ do preverjene stopnje iz konvencije (zaenkrat ZDA 15 %),
+ostalo je prikazano kot morebiten odbitek. Davek se izračuna na ravni zavezanca, leta in obrazca, nato se razdeli med
+borzne posrednike (le prikaz, ne ločena obveznost). D-IFI je prikazan tudi s scenarijem, v katerem terminske pogodbe in
+izdane opcije niso označene z vzvodom. Za podjetniške račune je prikazan le ponazoritveni izračun (22 % od 2024) od
+naložbenih postavk, ki **ni** obračun DDPO. Stopnje in viri so v `generators/taxrules.py`. Ocena ni odmera davka; omejitve
+so navedene na koncu `tax-summary.md`.
+
 **Preverjanje XML:** vsi štirje obrazci se preverijo z uradnimi XML shemami eDavkov (`generators/schemas/edavki`,
 nespremenjene kopije z edavki.durs.si, preverjene s SHA-256). XML je označen kot veljaven samo, če je bila uporabljena
 uradna shema; skripta tudi opozori, če FURS objavi novejšo različico sheme. Potreben je paket `xmlschema`.

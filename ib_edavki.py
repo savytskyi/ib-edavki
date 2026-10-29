@@ -10,10 +10,11 @@ import sys
 import requests
 import xml.etree.ElementTree
 from collections import defaultdict
+from decimal import Decimal
 from difflib import SequenceMatcher
 from xml.dom import minidom
 
-from generators import company as companyExport, doh_obr, report, validation
+from generators import company as companyExport, doh_obr, report, taxsummary, validation
 from importers import exante, ibkr, saxo, tradestation
 from importers.accounts import COMPANY, PRIVATE, Accounts
 from importers.audit import Audit
@@ -114,27 +115,30 @@ def decimal(value, places=4):
     date, it returns the last value on the last previous day on which the rate exists
 """
 def getCurrencyRate(dateStr, currency, rates):
+    text, usedDateStr = getCurrencyRateText(dateStr, currency, rates)
+    if usedDateStr != dateStr:
+        print(
+            "There is no exchange rate for "
+            + str(dateStr)
+            + ", using "
+            + str(usedDateStr)
+        )
+    return float(text)
+
+
+""" The published BSI rate (decimal text) and the date it is taken from: the date itself or the last earlier date with
+    a rate. Shared by the forms (float) and the tax summary (Decimal). """
+def getCurrencyRateText(dateStr, currency, rates):
     if currency == "CNH":
         currency = "CNY"
     if dateStr in rates and currency in rates[dateStr]:
-        rate = float(rates[dateStr][currency])
-    else:
-        date = datetime.datetime.strptime(dateStr, "%Y%m%d")
-        for i in range(1, 10):
-            lastWorkingDate = date - datetime.timedelta(days=i)
-            lastWorkingDateStr = lastWorkingDate.strftime("%Y%m%d")
-            if lastWorkingDateStr in rates and currency in rates[lastWorkingDateStr]:
-                rate = float(rates[lastWorkingDateStr][currency])
-                print(
-                    "There is no exchange rate for "
-                    + str(dateStr)
-                    + ", using "
-                    + str(lastWorkingDateStr)
-                )
-                break
-            if i >= 9:
-                sys.exit("Error: There is no exchange rate for " + str(dateStr))
-    return rate
+        return rates[dateStr][currency], dateStr
+    date = datetime.datetime.strptime(dateStr, "%Y%m%d")
+    for i in range(1, 10):
+        lastWorkingDateStr = (date - datetime.timedelta(days=i)).strftime("%Y%m%d")
+        if lastWorkingDateStr in rates and currency in rates[lastWorkingDateStr]:
+            return rates[lastWorkingDateStr][currency], lastWorkingDateStr
+    sys.exit("Error: There is no exchange rate for " + str(dateStr))
 
 
 """ Interest payer data for Doh-Obr of non-IBKR brokers """
@@ -489,6 +493,7 @@ def main():
     ibTradeSections = []
     ibTransferSections = []
     ibCompanyCashSections = []
+    ibPrivateCashSections = []
     for ibXmlFilename in ibXmlFilenames:
         ibXml = xml.etree.ElementTree.parse(ibXmlFilename).getroot()
         ibFlexStatements = ibXml[0]
@@ -509,6 +514,7 @@ def main():
             ibTradeSections.append((ibFlexStatement.get("accountId"), ibFlexStatement.find("Trades")))
             ibTradesList.append(ibFlexStatement.find("Trades"))
             ibCashTransactionsList.append(ibFlexStatement.find("CashTransactions"))
+            ibPrivateCashSections.append((ibFlexStatement.get("accountId"), ibFlexStatement.find("CashTransactions")))
             ibSecuritiesInfoList.append(ibFlexStatement.find("SecuritiesInfo"))
 
             if ibFlexStatement.find("AccountInformation") is not None:
@@ -1848,6 +1854,32 @@ def main():
     audit.add("Brokerage commissions and financing costs are not included in personal forms (eDavki applies standardized costs).")
     audit.add("Every personal lot realized in %d is listed in %s with the original broker transaction ids and prices "
               "in the original currency." % (reportYear, lotsFilename))
+
+    """ Estimated tax of all years in the input, from the same pool, exclusions and rates (does not change the XML) """
+    toEURDecimal = lambda amount, currency, date: amount if currency == "EUR" else \
+        amount / Decimal(getCurrencyRateText(date, currency, rates)[0])
+    summaryCash = [c for c in brokerCash if accounts.owner(c["broker"], c["accountId"]) == PRIVATE] + \
+        ibkr.importCashTransactions(ibPrivateCashSections)
+    formResults = {form: sum(-t["quantity"] * t["tradePriceEUR"] for groups in groupsOfForm for ts in groups.values() for t in ts)
+                   for form, groupsOfForm in (("Doh-KDVP", (longNormalTrades, shortNormalTrades)),
+                                              ("D-IFI", (longDerivateTrades, shortDerivateTrades)))}
+    try:
+        estimate = taxsummary.Summary(
+            taxpayerConfig["name"], privateBrokerTrades, excludedIds, companyTrades, summaryCash, companyCash, companies,
+            toEURDecimal, reportYear, ibkrLots=args.ibkr_lots, orderingRisks=orderingRisks,
+            reconciliation={"lotsEUR": declaredLotsEUR, "forms": formResults,
+                            "dividendsGross": sum(d["amountEUR"] for d in reportedDividends),
+                            "dividendsForeignTax": sum(d["taxEUR"] for d in reportedDividends),
+                            "brokerInterest": sum(i["amountEUR"] for i in brokerInterests)})
+        summaryFiles = taxsummary.generate(estimate)
+        print("%s created (estimated tax %s)" % (", ".join(summaryFiles[0:2]), ", ".join(
+            "%d: %s EUR" % (year, taxsummary.fmt(estimate.results[year]["personalTax"])) for year in estimate.years)))
+        audit.add("Estimated tax of all years is in tax-summary.md, tax-summary.csv and tax-summary-<year>.md. It is an "
+                  "estimate from the same lots and rates and does not change the XML.")
+    except Exception as e:
+        """ The estimate never blocks the forms and the report """
+        print("WARNING: the estimated tax summary could not be created (%s: %s)" % (type(e).__name__, e))
+        audit.add("The estimated tax summary could not be created (%s: %s); the forms are not affected." % (type(e).__name__, e))
 
     """ Validation of the personal forms against the official eDavki schemas """
     validationResults = [validation.validate(f) for f in ["Doh-KDVP.xml", "D-IFI.xml", "Doh-Div.xml", "Doh-Obr.xml"]]
